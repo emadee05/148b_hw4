@@ -12,9 +12,16 @@ are complete and should not be modified.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 from torch import Tensor
+
+
+def _broadcast_time(t: Tensor, x: Tensor) -> Tensor:
+    """Reshape (B,) time to broadcast with (B, *spatial)."""
+    return t.view(t.shape[0], *([1] * (x.dim() - 1)))
 
 
 class VPSDE:
@@ -51,8 +58,7 @@ class VPSDE:
 
         Reference: Eq. (32) of Song21.
         """
-        # TODO (5.A.ii)
-        raise NotImplementedError
+        return self.beta_min + (self.beta_max - self.beta_min) * t
 
     def c(self, t: Tensor) -> Tensor:
         """c(t) = exp(-½ ∫_0^t β(s) ds) — the signal decay factor.
@@ -68,8 +74,8 @@ class VPSDE:
 
         Reference: Eq. (33) of Song21.
         """
-        # TODO (5.A.ii)
-        raise NotImplementedError
+        integral = self.beta_min * t + 0.5 * (self.beta_max - self.beta_min) * t ** 2
+        return torch.exp(-0.5 * integral)
 
     def sigma(self, t: Tensor) -> Tensor:
         """σ(t) = √(1 - c(t)²) — the noise standard deviation.
@@ -80,8 +86,7 @@ class VPSDE:
         Returns:
             σ(t), same shape as t.
         """
-        # TODO (5.A.iii)
-        raise NotImplementedError
+        return torch.sqrt(1.0 - self.c(t) ** 2)
 
     def drift(self, x: Tensor, t: Tensor) -> Tensor:
         """Drift coefficient  f(x, t) = -½ β(t) x.
@@ -93,8 +98,8 @@ class VPSDE:
         Returns:
             Drift f(x, t), same shape as x.
         """
-        # TODO (5.A.i)
-        raise NotImplementedError
+        b = self.beta(t)
+        return -0.5 * _broadcast_time(b, x) * x
 
     def diffusion(self, t: Tensor) -> Tensor:
         """Diffusion coefficient  g(t) = √β(t).
@@ -105,8 +110,7 @@ class VPSDE:
         Returns:
             g(t), same shape as t.
         """
-        # TODO (5.A.i)
-        raise NotImplementedError
+        return torch.sqrt(self.beta(t))
 
     def marginal(self, x0: Tensor, t: Tensor) -> tuple[Tensor, Tensor]:
         """Sample from the forward marginal  q(x_t | x_0).
@@ -121,12 +125,25 @@ class VPSDE:
         Returns:
             (x_t, eps): noised sample and the noise used, both shape (B, *).
         """
-        # TODO (5.A.iii)
-        raise NotImplementedError
+        eps = torch.randn_like(x0)
+        c_t = _broadcast_time(self.c(t), x0)
+        s_t = _broadcast_time(self.sigma(t), x0)
+        x_t = c_t * x0 + s_t * eps
+        return x_t, eps
 
     # ------------------------------------------------------------------
     # 5.B  Samplers
     # ------------------------------------------------------------------
+
+    def _reverse_drift(
+        self, x: Tensor, t: Tensor, score: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Reverse-SDE drift and diffusion at time t."""
+        b = self.beta(t)
+        b_bc = _broadcast_time(b, x)
+        drift = -0.5 * b_bc * x - b_bc * score
+        diff = torch.sqrt(b_bc)
+        return drift, diff
 
     @torch.no_grad()
     def euler_maruyama(
@@ -153,10 +170,43 @@ class VPSDE:
             Generated samples, shape (B, C, H, W), values in [-1, 1].
         """
         num_steps = num_steps or self.T
-        # TODO (5.B.i) — implement the EM sampler
-        # Hint: time runs from t=1 down to t≈0 in steps of Δt = 1/num_steps.
-        #       At t=1, initialise x ~ N(0, σ(1)² I).
-        raise NotImplementedError
+        device = torch.device(device)
+        B = shape[0]
+        dt = -1.0 / num_steps
+
+        t1 = torch.ones(B, device=device)
+        s1 = self.sigma(t1).view(B, *([1] * (len(shape) - 1)))
+        x = torch.randn(shape, device=device) * s1
+
+        for i in range(num_steps):
+            t_val = 1.0 - i / num_steps
+            t = torch.full((B,), t_val, device=device)
+            score = score_model(x, t)
+            drift, diff = self._reverse_drift(x, t, score)
+            noise = torch.randn_like(x)
+            x = x + drift * dt + diff * math.sqrt(-dt) * noise
+
+        return x.clamp(-1.0, 1.0)
+
+    def _langevin_corrector(
+        self,
+        x: Tensor,
+        t: Tensor,
+        score_model: nn.Module,
+        n_corrector: int,
+        snr: float,
+    ) -> Tensor:
+        """Annealed Langevin corrector steps (Algorithm 5, Song21)."""
+        for _ in range(n_corrector):
+            score = score_model(x, t)
+            noise = torch.randn_like(x)
+            grad_norm = torch.norm(score.reshape(score.shape[0], -1), dim=-1).mean()
+            noise_norm = torch.norm(noise.reshape(noise.shape[0], -1), dim=-1).mean()
+            alpha = self.c(t) ** 2
+            step_size = (snr * noise_norm / (grad_norm + 1e-8)) ** 2 * 2.0 * alpha
+            step_bc = _broadcast_time(step_size, x)
+            x = x + step_bc * score + torch.sqrt(2.0 * step_bc) * noise
+        return x
 
     @torch.no_grad()
     def predictor_corrector(
@@ -185,8 +235,26 @@ class VPSDE:
             Generated samples, shape (B, C, H, W), values in [-1, 1].
         """
         num_steps = num_steps or self.T
-        # TODO (5.B.ii)
-        raise NotImplementedError
+        device = torch.device(device)
+        B = shape[0]
+        dt = -1.0 / num_steps
+
+        t1 = torch.ones(B, device=device)
+        s1 = self.sigma(t1).view(B, *([1] * (len(shape) - 1)))
+        x = torch.randn(shape, device=device) * s1
+
+        for i in range(num_steps):
+            t_val = 1.0 - i / num_steps
+            t = torch.full((B,), t_val, device=device)
+
+            x = self._langevin_corrector(x, t, score_model, n_corrector, snr)
+
+            score = score_model(x, t)
+            drift, diff = self._reverse_drift(x, t, score)
+            noise = torch.randn_like(x)
+            x = x + drift * dt + diff * math.sqrt(-dt) * noise
+
+        return x.clamp(-1.0, 1.0)
 
     # ------------------------------------------------------------------
     # 5.D  Inverse problems (EC)
@@ -223,5 +291,30 @@ class VPSDE:
             Reconstructed images, shape (B, C, H, W).
         """
         num_steps = num_steps or self.T
-        # TODO (EC 5.D)
-        raise NotImplementedError
+        device = torch.device(device)
+        shape = corrupted.shape
+        B = shape[0]
+        dt = -1.0 / num_steps
+        corrupted = corrupted.to(device)
+        mask = mask.to(device)
+
+        t1 = torch.ones(B, device=device)
+        s1 = self.sigma(t1).view(B, *([1] * (len(shape) - 1)))
+        x = torch.randn(shape, device=device) * s1
+
+        for i in range(num_steps):
+            t_val = 1.0 - i / num_steps
+            t = torch.full((B,), t_val, device=device)
+
+            score = score_model(x, t)
+            drift, diff = self._reverse_drift(x, t, score)
+            noise = torch.randn_like(x)
+            x = x + drift * dt + diff * math.sqrt(-dt) * noise
+
+            c_t = _broadcast_time(self.c(t), corrupted)
+            s_t = _broadcast_time(self.sigma(t), corrupted)
+            eps = torch.randn_like(corrupted)
+            x_known = c_t * corrupted + s_t * eps
+            x = x * (1.0 - mask) + x_known * mask
+
+        return x.clamp(-1.0, 1.0)

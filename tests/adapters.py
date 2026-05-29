@@ -20,32 +20,27 @@ from diffusion.rectflow import RectifiedFlow
 
 def make_vpsde(beta_min: float = 0.01, beta_max: float = 5.0, T: int = 1000) -> VPSDE:
     """Return a VPSDE instance with the given hyperparameters."""
-    # TODO: return VPSDE(...)
-    raise NotImplementedError
+    return VPSDE(beta_min=beta_min, beta_max=beta_max, T=T)
 
 
 def run_beta(sde: VPSDE, t: Tensor) -> Tensor:
     """Return β(t)."""
-    # TODO
-    raise NotImplementedError
+    return sde.beta(t)
 
 
 def run_c(sde: VPSDE, t: Tensor) -> Tensor:
     """Return c(t)."""
-    # TODO
-    raise NotImplementedError
+    return sde.c(t)
 
 
 def run_sigma(sde: VPSDE, t: Tensor) -> Tensor:
     """Return σ(t)."""
-    # TODO
-    raise NotImplementedError
+    return sde.sigma(t)
 
 
 def run_marginal(sde: VPSDE, x0: Tensor, t: Tensor) -> tuple[Tensor, Tensor]:
     """Return (x_t, eps) from the VP marginal q(x_t | x_0)."""
-    # TODO
-    raise NotImplementedError
+    return sde.marginal(x0, t)
 
 
 # ------------------------------------------------------------------
